@@ -1,0 +1,154 @@
+name: securemcp
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: infra/Dockerfile
+  image: securemcp-backend:local
+  init: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/tmp:mode=1777"]
+  environment: &runtime
+    SMCP_LOCAL_DEMO: "true"
+    SMCP_CRM_SECRET: ${SMCP_CRM_SECRET:?run make bootstrap first}
+    SMCP_DOCS_SECRET: ${SMCP_DOCS_SECRET:?run make bootstrap first}
+    SMCP_MESSAGES_SECRET: ${SMCP_MESSAGES_SECRET:?run make bootstrap first}
+    SMCP_REVIEW_SECRET: ${SMCP_REVIEW_SECRET:?run make bootstrap first}
+    SMCP_DATABASE_URL: postgresql+asyncpg://securemcp:${POSTGRES_PASSWORD:?run make bootstrap first}@postgres:5432/securemcp
+    SMCP_REDIS_URL: redis://redis:6379/0
+    SMCP_OPA_URL: http://opa:8181
+    SMCP_OIDC_BACKCHANNEL: http://keycloak:8080/realms/securemcp
+    SMCP_CRM_URL: http://172.31.93.11:8101/mcp
+    SMCP_DOCS_URL: http://172.31.93.12:8102/mcp
+    SMCP_MESSAGES_URL: http://172.31.93.13:8103/mcp
+  networks: [private]
+services:
+  postgres:
+    image: postgres:16.13-alpine
+    environment:
+      POSTGRES_USER: securemcp
+      POSTGRES_DB: securemcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run make bootstrap first}
+    networks: [private]
+    volumes: [data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "securemcp", "-d", "securemcp"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7.4.7-alpine
+    command: ["redis-server","--save","","--appendonly","no"]
+    networks: [private]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  opa:
+    image: openpolicyagent/opa:1.8.0-static
+    command: ["run","--server","--addr=0.0.0.0:8181","/policy/access.rego"]
+    volumes: ["./policy:/policy:ro"]
+    networks: [private]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.6.3
+    command: ["start-dev", "--import-realm", "--hostname=http://localhost:8080"]
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - type: bind
+        source: ./.local/securemcp-realm.json
+        target: /opt/keycloak/data/import/securemcp-realm.json
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [private, edge]
+  migrate:
+    <<: *backend
+    environment:
+      <<: *runtime
+      SMCP_DB_GATEWAY_PASSWORD: ${SMCP_DB_GATEWAY_PASSWORD:?run make bootstrap first}
+      SMCP_DB_CRM_PASSWORD: ${SMCP_DB_CRM_PASSWORD:?run make bootstrap first}
+      SMCP_DB_DOCS_PASSWORD: ${SMCP_DB_DOCS_PASSWORD:?run make bootstrap first}
+      SMCP_DB_MESSAGES_PASSWORD: ${SMCP_DB_MESSAGES_PASSWORD:?run make bootstrap first}
+    command: ["sh", "-ec", "alembic upgrade head && python -m securemcp.seed && python -m scripts.grant_db"]
+    depends_on:
+      postgres: {condition: service_healthy}
+  crm-mcp:
+    <<: *backend
+    environment:
+      SMCP_CONNECTOR: crm
+      SMCP_CONNECTOR_SECRET: ${SMCP_CRM_SECRET:?run make bootstrap first}
+      SMCP_DATABASE_URL: postgresql+asyncpg://smcp_crm:${SMCP_DB_CRM_PASSWORD:?run make bootstrap first}@postgres:5432/securemcp
+    command: ["uvicorn", "securemcp.upstream:app_factory", "--factory", "--host", "0.0.0.0", "--port", "8101", "--no-access-log"]
+    networks: {private: {ipv4_address: 172.31.93.11}}
+    depends_on: {migrate: {condition: service_completed_successfully}}
+  docs-mcp:
+    <<: *backend
+    environment:
+      SMCP_CONNECTOR: docs
+      SMCP_CONNECTOR_SECRET: ${SMCP_DOCS_SECRET:?run make bootstrap first}
+      SMCP_DATABASE_URL: postgresql+asyncpg://smcp_docs:${SMCP_DB_DOCS_PASSWORD:?run make bootstrap first}@postgres:5432/securemcp
+    command: ["uvicorn", "securemcp.upstream:app_factory", "--factory", "--host", "0.0.0.0", "--port", "8102", "--no-access-log"]
+    networks: {private: {ipv4_address: 172.31.93.12}}
+    depends_on: {migrate: {condition: service_completed_successfully}}
+  messages-mcp:
+    <<: *backend
+    environment:
+      SMCP_CONNECTOR: messages
+      SMCP_CONNECTOR_SECRET: ${SMCP_MESSAGES_SECRET:?run make bootstrap first}
+      SMCP_DATABASE_URL: postgresql+asyncpg://smcp_messages:${SMCP_DB_MESSAGES_PASSWORD:?run make bootstrap first}@postgres:5432/securemcp
+    command: ["uvicorn", "securemcp.upstream:app_factory", "--factory", "--host", "0.0.0.0", "--port", "8103", "--no-access-log"]
+    networks: {private: {ipv4_address: 172.31.93.13}}
+    depends_on: {migrate: {condition: service_completed_successfully}}
+  gateway:
+    <<: *backend
+    environment:
+      <<: *runtime
+      SMCP_DATABASE_URL: postgresql+asyncpg://smcp_gateway:${SMCP_DB_GATEWAY_PASSWORD:?run make bootstrap first}@postgres:5432/securemcp
+    networks: [private, edge]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      keycloak: {condition: service_started}
+      opa: {condition: service_started}
+      crm-mcp: {condition: service_started}
+      docs-mcp: {condition: service_started}
+      messages-mcp: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+  tests:
+    <<: *backend
+    profiles: [test]
+    image: securemcp-test:local
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      target: test
+    command: ["python", "-m", "scripts.test_stack"]
+    depends_on: {migrate: {condition: service_completed_successfully}, opa: {condition: service_started}}
+  frontend:
+    build: ./frontend
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports: ["127.0.0.1:5173:8080"]
+    networks: [edge]
+    depends_on: {gateway: {condition: service_healthy}}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/ready"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+networks:
+  private:
+    internal: true
+    ipam:
+      config: [{subnet: 172.31.93.0/24}]
+  edge: {}
+volumes:
+  data: {}

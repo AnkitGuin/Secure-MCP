@@ -1,0 +1,45 @@
+name: SecureMCP CI
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  code-and-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: {fetch-depth: 0}
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12.14'}
+      - uses: astral-sh/setup-uv@v7
+        with: {version: '0.10.9'}
+      - uses: actions/setup-node@v6
+        with: {node-version: '24.22.1', cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy --follow-imports=silent --ignore-missing-imports securemcp/config.py securemcp/security.py securemcp/policy.py securemcp/wire.py
+      - run: npm ci && npm run lint && npm run build && npm audit --audit-level=moderate
+        working-directory: frontend
+      - run: |
+          uv export --frozen --no-dev --no-hashes --format requirements-txt -o /tmp/securemcp-requirements.txt
+          uv run pip-audit --requirement /tmp/securemcp-requirements.txt --disable-pip --no-deps
+      - run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.0 git --redact /repo
+      - run: docker run --rm -v "$PWD/policy:/policy:ro" openpolicyagent/opa:1.8.0-static test /policy -v
+
+  live-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12.14'}
+      - uses: astral-sh/setup-uv@v7
+        with: {version: '0.10.9'}
+      - uses: actions/setup-node@v6
+        with: {node-version: '24.22.1', cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: make bootstrap
+      - run: make test && make smoke && make demo
+      - run: npm ci && npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: make test-e2e
+      - run: docker compose --env-file .local/secrets.env ps
+        if: always()
